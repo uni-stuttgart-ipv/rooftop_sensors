@@ -16,13 +16,32 @@
 #include "driver/spi_master.h"
 #include "esp_sntp.h"
 #include "time.h"
+#include <sys/time.h>
 #include "esp_sleep.h"
 #include "env_config.h"
 #include "esp_mac.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "driver/gpio.h"
+#include "esp_https_ota.h"
+#include "esp_http_client.h"
+#include "esp_timer.h"
+#include <stdint.h>
+#include "esp_spiffs.h"
+#include <sys/stat.h>
 
+static const char *TAG_HTTP = "HTTP_TIME";
+static bool sntp_initialized = false;
+
+void obtain_time(void);
+bool is_daytime(void);
+void send_eeprom_data(void);
+esp_err_t send_to_influx_batch(const char *payload);
+
+extern const uint8_t InfluxRootCA_pem_start[] asm("_binary_InfluxRootCA_pem_start");
+extern const uint8_t InfluxRootCA_pem_end[]   asm("_binary_InfluxRootCA_pem_end");
 
 // Wifi configurations included in env_config.h
-
 
 // I2C (ADC)
 #define I2C_MASTER_SCL_IO           22
@@ -50,10 +69,12 @@
 static const float A = 3.9083e-3;
 static const float B = -5.775e-7;
 
+#define BUZZER_PIN 2
+
 
 // GLOBALS 
 static const char *TAGMQTT = "ESP32_ADC_TEMP_MQTT";
-static esp_mqtt_client_handle_t mqtt_client;
+// static esp_mqtt_client_handle_t mqtt_client;
 static char topic[64];
 static spi_device_handle_t spi; // MAX31865 SPI handle
 static SemaphoreHandle_t i2c_semaphore = NULL;
@@ -78,8 +99,141 @@ typedef struct {
 
 static QueueHandle_t sensor_queue;
 
+#define OTA_URL "http://NEHA.local:8000/esp32.bin"
+static const char *TAG_OTA = "OTA";
+
 sensor_sample_t eeprom_buffer[MAX_SAMPLES];
 int eeprom_index = 0;  // next free slot
+
+void send_eeprom_task(void *pvParameters) {
+    send_eeprom_data();
+    vTaskDelete(NULL);
+}
+ 
+//checking log size to decide if it needs to be cleared
+bool is_log_too_large(size_t max_size)
+{
+    struct stat st;
+    if (stat("/spiffs/logs.txt", &st) == 0) {
+        return st.st_size > max_size;
+    }
+    return false; // file doesn't exist yet
+}
+
+void clear_logs_spiffs()
+{
+    remove("/spiffs/logs.txt");
+}
+
+void init_spiffs() {
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "spiffs",
+        .max_files = 5,       // maximum open files at a time
+        .format_if_mount_failed = true
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE("SPIFFS", "Failed to mount SPIFFS");
+    } else {
+        size_t total = 0, used = 0;
+        esp_spiffs_info("spiffs", &total, &used);
+        ESP_LOGI("SPIFFS", "Total: %d, Used: %d", total, used);
+    }
+}
+
+//write logs to file
+void save_log_spiffs(const char *message)
+{
+    struct stat st;
+    if (stat("/spiffs/logs.txt", &st) == 0) {
+        if (st.st_size > 5000) {
+            ESP_LOGW("SPIFFS", "Log file too large, clearing...");
+            remove("/spiffs/logs.txt");  // delete old logs
+        }
+    }
+
+    //Open file
+    FILE *f = fopen("/spiffs/logs.txt", "a");
+    if (f == NULL) {
+        ESP_LOGE("SPIFFS", "Failed to open log file");
+        return;
+    }
+
+    //Write log
+    fprintf(f, "%s\n", message);
+
+    fclose(f);
+}
+
+//read logs
+void print_logs_spiffs() {
+    FILE *f = fopen("/spiffs/logs.txt", "r");
+    if (f == NULL) {
+        ESP_LOGE("SPIFFS", "No logs found");
+        return;
+    }
+
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        printf("%s", line);  // print to UART / monitor
+    }
+
+    fclose(f);
+}
+
+
+void buzzer_init()
+{
+    gpio_reset_pin(BUZZER_PIN);
+    gpio_set_direction(BUZZER_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(BUZZER_PIN, 0);
+}
+
+// Play a single note of given frequency (Hz) and duration (ms)
+void play_note(uint32_t freq, uint32_t duration_ms)
+{
+    if (freq == 0) {
+        vTaskDelay(pdMS_TO_TICKS(duration_ms)); // silence
+        return;
+    }
+
+    uint32_t period_us = 1000000 / freq;  // microseconds per cycle
+    uint32_t half_period = period_us / 2;
+    uint32_t start_time = esp_timer_get_time();
+    uint32_t end_time = start_time + (duration_ms * 1000);
+
+    while (esp_timer_get_time() < end_time) {
+        gpio_set_level(BUZZER_PIN, 1);
+        uint32_t t = esp_timer_get_time();
+        while ((esp_timer_get_time() - t) < half_period) {} // busy wait
+
+        gpio_set_level(BUZZER_PIN, 0);
+        t = esp_timer_get_time();
+        while ((esp_timer_get_time() - t) < half_period) {}
+    }
+}
+
+void play_wifi_connected()
+{
+    play_note(523, 100);  // C5
+    play_note(659, 100);  // E5
+    play_note(784, 150);  // G5
+    play_note(1047, 200); // C6
+}
+
+void play_voltage_sensed()
+{
+    play_note(1000, 40);
+}
+
+void play_data_sent()
+{
+    play_note(784, 80);
+    play_note(659, 80);
+}
+
 
 
 //  HELPER: MAC ADDRESS 
@@ -92,6 +246,33 @@ void get_mac_address(char *mac_str, size_t len) {
 
 static const char *TAG = "MCP3426";
 
+void ota_update_task(void *pvParameter)
+{
+    ESP_LOGI(TAG, "Starting OTA update...");
+
+    // First create http client config
+    esp_http_client_config_t http_config = {
+        .url = OTA_URL,
+        .timeout_ms = 10000,
+    };
+
+    // Then create OTA config and assign pointer
+    esp_https_ota_config_t ota_config = {
+        .http_config = &http_config
+    };
+
+    // Start OTA
+    esp_err_t ret = esp_https_ota(&ota_config);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "OTA update successful, restarting...");
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "OTA update failed! Error 0x%x", ret);
+    }
+
+    vTaskDelete(NULL);
+}
 
 // I²C initialization
 static esp_err_t i2c_master_init(void)
@@ -160,7 +341,9 @@ float getVoltage()
     int adcReading = getADC(1);
     float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
     voltage *= (118.0f + 4.02f) / 4.02f;                     // voltage divider
-    voltage *= 2;
+    voltage *= 1.975; 
+    play_voltage_sensed();
+    save_log_spiffs("Voltage measured");
     return voltage;
 }
 
@@ -169,7 +352,7 @@ float getCurrent()
     int adcReading = getADC(2);
     float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
     float current = (voltage * 1.62f) - 0.33f; // apply sensor scaling factor
-    current = (current/0.264f)*2;
+    current = (current/0.264f)*1.975;
     return (current < 0.0f) ? 0.0f : current;
 }
 
@@ -229,32 +412,7 @@ float getTemperature() {
     return temp;
 }
 
-bool mqtt_ready = false;
-
-void mqtt_event_handler(void *handler_args, esp_event_base_t base,
-                        int32_t event_id, void *event_data) {
-    esp_mqtt_event_handle_t event = event_data;
-
-    if(event->event_id == MQTT_EVENT_CONNECTED) {
-        ESP_LOGI(TAGMQTT, "MQTT connected");
-        mqtt_ready = true;
-    }
-    else if(event->event_id == MQTT_EVENT_DISCONNECTED) {
-        ESP_LOGW(TAGMQTT, "MQTT disconnected");
-        mqtt_ready = false;
-    }
-}
-
-
-static void mqtt_app_start(void) {
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_URI,
-    };
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(mqtt_client);
-}
-
+//bool mqtt_ready = false;
 
 // Wi-Fi event handler for reconnection
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -262,10 +420,32 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAGMQTT, "Wi-Fi disconnected. Reconnecting...");
+        save_log_spiffs("Wi-Fi disconnected. Reconnecting...");
         esp_wifi_connect();  // attempt reconnect
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
-        ESP_LOGI(TAGMQTT, "Wi-Fi connected.");
+        ESP_LOGI(TAGMQTT, "Wi-Fi associated with AP, waiting for IP...");
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAGMQTT, "Wi-Fi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+
+        save_log_spiffs("WiFi connected");
+
+        play_wifi_connected();
+        //vTaskDelay(pdMS_TO_TICKS(500));
+
+        //Initialising SNTP
+    if (!sntp_initialized) {
+        obtain_time();
+        sntp_initialized = true;
+    }
+    
+    //creating a small task to do eeprom data transfer
+    xTaskCreate(send_eeprom_task, "send_eeprom_task", 8192, NULL, 5, NULL);
+        
+    // Start OTA task
+    xTaskCreate(&ota_update_task, "ota_task", 8192, NULL, 5, NULL);
     }
 }
 
@@ -294,6 +474,13 @@ void wifi_init_sta(void) {
         NULL,
         NULL
     ));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT,
+        IP_EVENT_STA_GOT_IP,
+        &wifi_event_handler,
+        NULL,
+        NULL
+    ));
 
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_connect());
@@ -303,10 +490,14 @@ void wifi_init_sta(void) {
 }
 
 
+
+
 void obtain_time(void) {
     ESP_LOGI(TAGMQTT, "Initializing SNTP...");
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "time3.uni-stuttgart.de");
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
     esp_sntp_init();
 
 
@@ -328,11 +519,15 @@ void obtain_time(void) {
         char strftime_buf[64];
         strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
         ESP_LOGI(TAGMQTT, "Current local time: %s", strftime_buf);
+        char log_msg[128];
+        snprintf(log_msg, sizeof(log_msg), "Time: %s", strftime_buf);
+        save_log_spiffs(log_msg);
     } 
     else {
         ESP_LOGW(TAGMQTT, "Failed to synchronize time.");
     }
 }
+
 
 
 bool is_daytime(void) {
@@ -343,6 +538,12 @@ bool is_daytime(void) {
 
     int hour = timeinfo.tm_hour;
     return (hour >= SUNRISE_HOUR && hour < SUNSET_HOUR);
+
+    // ESP_LOGI(TAGMQTT, "Mock daytime for testing");
+    // return true;
+
+//     ESP_LOGI(TAGMQTT, "Mock night for testing");
+//     return false;
 }
 
 
@@ -369,92 +570,279 @@ bool wifi_connected() {
 }
 
 
-//  SAVE SAMPLE TO EEPROM (simulated with RAM buffer) 
-void save_to_eeprom(sensor_sample_t *sample, int index) {
-    if (index < MAX_SAMPLES) {
-        eeprom_buffer[index] = *sample;
-        ESP_LOGI(TAGMQTT, "Saved sample to EEPROM at index %d", index);
+void send_to_influx(sensor_sample_t sample) {
+    char line[256];
+    time_t ts = sample.timestamp;
+
+    // Prepare InfluxDB line protocol
+    snprintf(line, sizeof(line),
+        "solar_data,device=esp32_01 voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
+        sample.voltage, sample.current, sample.power, sample.temperature, ts
+    );
+
+    // Build full URL
+    char url[256];
+    snprintf(url, sizeof(url),
+             "%s/api/v2/write?org=%s&bucket=%s&precision=s",
+             INFLUX_URL, INFLUX_ORG, INFLUX_BUCKET);
+
+    // HTTP client config
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    // **Important:** Authorization header must start with "Token "
+    char auth_header[512];
+    snprintf(auth_header, sizeof(auth_header), "Token %s", INFLUX_TOKEN);
+    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_header(client, "Content-Type", "text/plain; charset=utf-8");
+
+    // Set data to POST
+    esp_http_client_set_post_field(client, line, strlen(line));
+
+    // Perform request
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        if (status == 204) {
+            ESP_LOGI(TAGMQTT, "InfluxDB write OK");
+            save_log_spiffs("Data sent to InfluxDB");
+            play_data_sent();
+            //vTaskDelete(NULL);
+        } else {
+            ESP_LOGE(TAGMQTT, "InfluxDB HTTP error: %d", status);
+        }
+    } else {
+        ESP_LOGE(TAGMQTT, "InfluxDB POST failed: %s", esp_err_to_name(err));
     }
+
+    // Cleanup
+    esp_http_client_cleanup(client);
 }
 
+bool is_eeprom_too_large(size_t max_size)
+{
+    struct stat st;
 
-// SEND SAMPLE VIA MQTT 
-// void send_via_mqtt(sensor_sample_t sample) {
-//     char payload[200];
-//     snprintf(payload, sizeof(payload),
-//              "{\"voltage\": %.2f, \"current\": %.2f, \"power\": %.2f, \"temperature\": %.2f, \"timestamp\": %lld}",
-//              sample.voltage, sample.current, sample.power, sample.temperature, (long long)sample.timestamp);
+    if (stat("/spiffs/eeprom_data.bin", &st) == 0) {
+        return st.st_size > max_size;
+    }
 
-    
-    
-//     if (mqtt_client != NULL) {
-//         int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-//         ESP_LOGI(TAGMQTT, "Published: %s (msg_id=%d)", payload, msg_id);
-//     } else {
-//         ESP_LOGW(TAGMQTT, "MQTT client not started, cannot send");
+    return false;
+}
+
+//sending data to influxdb as batch
+// esp_err_t send_to_influx_batch(const char *payload)
+// {
+//     esp_http_client_config_t config = {
+//         .url = "http://YOUR_INFLUX_URL",
+//         .method = HTTP_METHOD_POST,
+//         .timeout_ms = 5000,
+//     };
+
+//     esp_http_client_handle_t client = esp_http_client_init(&config);
+
+//     esp_http_client_set_header(client, "Content-Type", "text/plain");
+
+//     esp_http_client_set_post_field(client, payload, strlen(payload));
+
+//     esp_err_t err = esp_http_client_perform(client);
+
+//     esp_http_client_cleanup(client);
+
+//     return err;
+// }
+
+// //  SAVE SAMPLE TO EEPROM (simulated with RAM buffer) 
+// void save_to_eeprom(sensor_sample_t *sample, int index) {
+//     if (index < MAX_SAMPLES) {
+//         eeprom_buffer[index] = *sample;
+//         ESP_LOGI(TAGMQTT, "Saved sample to EEPROM at index %d", index);
 //     }
+//     // eeprom_index=index;
+//     ESP_LOGI(TAGMQTT, "Total sample index noted to be %d",eeprom_index);
 // }
 
 
-void send_via_mqtt(sensor_sample_t sample) {
-    char payload[200];
-    snprintf(payload, sizeof(payload),
-             "{\"voltage\": %.2f, \"current\": %.2f, \"power\": %.2f, \"temperature\": %.2f, \"timestamp\": %lld}",
-             sample.voltage, sample.current, sample.power, sample.temperature, (long long)sample.timestamp);
+// //  READ SAMPLE FROM EEPROM (RAM buffer for simulation) 
+// void read_from_eeprom(int index, sensor_sample_t *sample) {
+//     if (index < MAX_SAMPLES && sample != NULL) {
+//         *sample = eeprom_buffer[index];
+//     } else {
+//         ESP_LOGW(TAGMQTT, "EEPROM read failed at index %d", index);
+//     }
+// }
 
-    // Check if MQTT client is initialized and connected
-    if (mqtt_client == NULL) {
-        ESP_LOGW(TAGMQTT, "MQTT client not started, cannot send");
+// // SEND ALL EEPROM SAMPLES AFTER SUNSET 
+// void send_eeprom_data() {
+//     ESP_LOGI(TAGMQTT, "Calling send_eeprom function");
+//     ESP_LOGI(TAGMQTT, "Total sample index noted to be %d",eeprom_index);
+//     if (eeprom_index == 0) 
+//     {
+//         ESP_LOGI(TAGMQTT, "Nothing to sent from EEPROM");
+//         return; // nothing to send
+//     }
+//     ESP_LOGI(TAGMQTT, "Sending %d stored samples from EEPROM...", eeprom_index);
+//     for (int i = 0; i < eeprom_index; i++) {
+//         send_to_influx(eeprom_buffer[i]);
+//         vTaskDelay(pdMS_TO_TICKS(500)); // small delay between messages
+//     }
+//     ESP_LOGI(TAGMQTT, "All stored EEPROM data sent. Clearing buffer.");
+//     save_log_spiffs("All data from eeprom sent");
+//     eeprom_index = 0; // clear buffer
+// }
+
+void save_eeprom_data(sensor_sample_t *sample)
+{
+    // Check if file is too large BEFORE writing
+    if (is_eeprom_too_large(50 * 1024)) {   // 50 KB limit
+        ESP_LOGW("SPIFFS", "EEPROM file too large, clearing...");
+        remove("/spiffs/eeprom_data.bin");
+    }
+    FILE *f = fopen("/spiffs/eeprom_data.bin", "ab");
+    if (!f) {
+        ESP_LOGE("SPIFFS", "Failed to open EEPROM file");
         return;
     }
 
-    // Wait until MQTT is connected
-    int retry_count = 0;
-    const int max_retries = 5;
-    while (!mqtt_ready && retry_count < max_retries) {
-        ESP_LOGW(TAGMQTT, "MQTT not connected yet, retrying... (%d/%d)", retry_count+1, max_retries);
+    fwrite(sample, sizeof(sensor_sample_t), 1, f);
+    fclose(f);
+
+    ESP_LOGI("SPIFFS", "EEPROM sample saved");
+}
+
+//to print data stored in eeprom
+void print_eeprom_data()
+{
+    FILE *f = fopen("/spiffs/eeprom_data.bin", "rb");
+    if (!f) {
+        ESP_LOGW(TAGMQTT, "No EEPROM data found");
+        return;
+    }
+
+    sensor_sample_t sample;
+    int i = 0;
+
+    ESP_LOGI(TAGMQTT, "----- EEPROM DATA START -----");
+
+    while (fread(&sample, sizeof(sensor_sample_t), 1, f) == 1) {
+        ESP_LOGI(TAGMQTT,
+                 "EEPROM[%d]: V=%.2f V | I=%.2f A | P=%.2f W | T=%.2f °C | TS=%lld",
+                 i,
+                 sample.voltage,
+                 sample.current,
+                 sample.power,
+                 sample.temperature,
+                 (long long)sample.timestamp);
+        i++;
+    }
+
+    ESP_LOGI(TAGMQTT, "----- EEPROM DATA END (%d samples) -----", i);
+
+    fclose(f);
+}
+
+void send_eeprom_data()
+{
+    FILE *f = fopen("/spiffs/eeprom_data.bin", "rb");
+
+    if (!f) {
+        ESP_LOGI("SPIFFS", "No EEPROM data to send");
+        return;
+    }
+
+    sensor_sample_t sample;
+
+    ESP_LOGI("SPIFFS", "Sending EEPROM data...");
+    int count = 0;
+
+    ESP_LOGI("SPIFFS", "===== START SENDING EEPROM DATA =====");
+
+    while (fread(&sample, sizeof(sensor_sample_t), 1, f) == 1) {
+        send_to_influx(sample);
+        count++;
+
+        ESP_LOGI("SPIFFS",
+                 "Sent [%d]: V=%.2f V | I=%.2f A | P=%.2f W | T=%.2f °C | TS=%lld",
+                 count,
+                 sample.voltage,
+                 sample.current,
+                 sample.power,
+                 sample.temperature,
+                 (long long)sample.timestamp);
+
         vTaskDelay(pdMS_TO_TICKS(500));
-        retry_count++;
     }
 
-    if (!mqtt_ready) {
-        ESP_LOGE(TAGMQTT, "MQTT not connected after retries, dropping message: %s", payload);
-        return;
-    }
+    fclose(f);
 
-    // Attempt to publish
-    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-    if (msg_id < 0) {
-        ESP_LOGE(TAGMQTT, "Failed to publish MQTT message: %s", payload);
-    } else {
-        ESP_LOGI(TAGMQTT, "Published: %s (msg_id=%d)", payload, msg_id);
-    }
+    ESP_LOGI("SPIFFS",
+             "===== DONE: %d EEPROM samples sent to InfluxDB =====",
+             count);
+
+    ESP_LOGI("SPIFFS", "All EEPROM data sent. Clearing file.");
+
+    remove("/spiffs/eeprom_data.bin");
 }
 
+//function to send all eeprom data in one batch instead of multiple https requets
+// void send_eeprom_data()
+// {
+//     ESP_LOGI(TAGMQTT, "Calling send_eeprom function");
+//     ESP_LOGI(TAGMQTT, "Total sample index noted to be %d", eeprom_index);
 
+//     if (eeprom_index == 0) {
+//         ESP_LOGI(TAGMQTT, "Nothing to send from EEPROM");
+//         return;
+//     }
 
-// SEND ALL EEPROM SAMPLES AFTER SUNSET 
-void send_eeprom_data() {
-    if (eeprom_index == 0) return; // nothing to send
-    ESP_LOGI(TAGMQTT, "Sending %d stored samples from EEPROM...", eeprom_index);
-    for (int i = 0; i < eeprom_index; i++) {
-        send_via_mqtt(eeprom_buffer[i]);
-        vTaskDelay(pdMS_TO_TICKS(500)); // small delay between messages
-    }
-    ESP_LOGI(TAGMQTT, "All stored EEPROM data sent. Clearing buffer.");
-    eeprom_index = 0; // clear buffer
-}
+//     char payload[2048];  // adjust size if needed
+//     memset(payload, 0, sizeof(payload));
 
-//  READ SAMPLE FROM EEPROM (RAM buffer for simulation) 
-void read_from_eeprom(int index, sensor_sample_t *sample) {
-    if (index < MAX_SAMPLES && sample != NULL) {
-        *sample = eeprom_buffer[index];
-    } else {
-        ESP_LOGW(TAGMQTT, "EEPROM read failed at index %d", index);
-    }
-}
+//     ESP_LOGI(TAGMQTT, "Preparing batch payload...");
 
+//     for (int i = 0; i < eeprom_index; i++) {
 
+//         char line[256];
+
+//         snprintf(line, sizeof(line),
+//             "solar_data,device=esp32_01 voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld\n",
+//             eeprom_buffer[i].voltage,
+//             eeprom_buffer[i].current,
+//             eeprom_buffer[i].power,
+//             eeprom_buffer[i].temperature,
+//             (long long)eeprom_buffer[i].timestamp
+//         );
+
+//         // Prevent buffer overflow
+//         if (strlen(payload) + strlen(line) < sizeof(payload)) {
+//             strcat(payload, line);
+//         } else {
+//             ESP_LOGE(TAGMQTT, "Payload too large! Sending partial batch...");
+//             break;
+//         }
+//     }
+
+//     ESP_LOGI(TAGMQTT, "Sending batch to Influx...");
+
+//     // Send once
+//     int status = send_to_influx_batch(payload);
+
+//     if (status == ESP_OK) {
+//         ESP_LOGI(TAGMQTT, "Batch sent successfully. Clearing EEPROM.");
+
+//         save_log_spiffs("All EEPROM data sent");
+
+//         eeprom_index = 0;
+//     } else {
+//         ESP_LOGE(TAGMQTT, "Failed to send batch. Keeping data in EEPROM.");
+//     }
+// }
 
 void sensor_task(void *pvParameters) {
     sensor_sample_t sample;
@@ -471,6 +859,37 @@ void sensor_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(2000)); // delay in millisecond
     }
 }
+
+//obtaining sensor values by averaging
+// void sensor_task(void *pvParameters)
+// {
+//     while (1)
+//     {
+//         float voltage_sum = 0;
+//         float current_sum = 0;
+//         float temp_sum = 0;
+
+//         int samples = 4;
+
+//         for (int i = 0; i < samples; i++) {
+//             voltage_sum += getVoltage();
+//             current_sum += getCurrent();
+//             temp_sum += getTemperature();
+
+//             vTaskDelay(pdMS_TO_TICKS(1000)); // 1 reading/sec
+//         }
+
+//         sensor_sample_t sample;
+
+//         sample.voltage = voltage_sum / samples;
+//         sample.current = current_sum / samples;
+//         sample.temperature = temp_sum / samples;
+//         sample.power = sample.voltage * sample.current;
+//         sample.timestamp = time(NULL);
+
+//         xQueueSend(sensor_queue, &sample, pdMS_TO_TICKS(10));
+//     }
+// }
 
 
 
@@ -489,29 +908,41 @@ void wifi_mqtt_task(void *pvParameters) {
             bool day = is_daytime();
 
             if (wifi_ok && day) {
-                ESP_LOGI(TAGMQTT, "Wi-Fi OK + Nighttime: Sending data via MQTT...");
-                send_via_mqtt(sample);
-            } 
-            else if (!wifi_ok && day) {
-                ESP_LOGW(TAGMQTT, "Wi-Fi down (Daytime): Storing sample to EEPROM...");
+                ESP_LOGI(TAGMQTT, "Wi-Fi OK + Daytime: Sending data directly to InfluxDB...");
+                send_to_influx(sample);
+            }
 
-                if (eeprom_index < MAX_SAMPLES) {
-                    save_to_eeprom(&sample, eeprom_index++);
-                } else {
-                    ESP_LOGW(TAGMQTT, "EEPROM full, ignoring sample");
-                }
+            
 
-                // Immediately read back to verify
-                sensor_sample_t readback;
-                for (int i = 0; i < eeprom_index; i++) {
-                    read_from_eeprom(i, &readback);
-                    ESP_LOGI(TAGMQTT,
-                             "EEPROM[%d]: V=%.2f, I=%.2f, P=%.2f, T=%.2f, TS=%lld",
-                             i, readback.voltage, readback.current,
-                             readback.power, readback.temperature,
-                             (long long)readback.timestamp);
-                }
-            } 
+            // // else if (!wifi_ok && day) {
+            // else if (!wifi_ok) {
+            //     ESP_LOGW(TAGMQTT, "Wi-Fi down (Daytime): Storing sample to EEPROM...");
+
+            //     if (eeprom_index < MAX_SAMPLES) {
+            //         //save_to_eeprom(&sample, eeprom_index++);
+            //         save_eeprom_data(&sample);
+            //     } else {
+            //         ESP_LOGW(TAGMQTT, "EEPROM full, ignoring sample");
+            //     }
+
+            //     // Immediately read back to verify
+            //     sensor_sample_t readback;
+            //     for (int i = 0; i < eeprom_index; i++) {
+            //         read_from_eeprom(i, &readback);
+            //         ESP_LOGI(TAGMQTT,
+            //                  "EEPROM[%d]: V=%.2f, I=%.2f, P=%.2f, T=%.2f, TS=%lld",
+            //                  i, readback.voltage, readback.current,
+            //                  readback.power, readback.temperature,
+            //                  (long long)readback.timestamp);
+            //     }
+            // } 
+
+            else if (!wifi_ok) {
+                ESP_LOGW(TAGMQTT, "Wi-Fi down: Storing sample to EEPROM");
+                
+                save_eeprom_data(&sample);
+                print_eeprom_data();
+            }
             else {
                 ESP_LOGI(TAGMQTT, "Normal condition — No EEPROM/MQTT action.");
             }
@@ -534,20 +965,19 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    //spiffs logs
+    init_spiffs();
+    print_logs_spiffs();
+
+    buzzer_init();
+
     wifi_init_sta();        // initialize WiFi
-    obtain_time();          // synchronize time via SNTP
-    mqtt_app_start();       // start MQTT client
+    // obtain_time();          // synchronize time via SNTP
+    // mqtt_app_start();       // start MQTT client
 
-    // Wait until MQTT connected before starting tasks
+    ESP_LOGI("BOOT", "Reset reason: %d", esp_reset_reason());
+
     int wait_count = 0;
-    while (!mqtt_ready && wait_count++ < 20) {  // max 20 x 500ms = 10s
-        ESP_LOGI(TAGMQTT, "Waiting for MQTT to connect...");
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    if (!mqtt_ready) {
-        ESP_LOGW(TAGMQTT, "MQTT failed to connect after 10s");
-    }
-
     if (!is_daytime() && wifi_connected()) {
         send_eeprom_data();
         sleep_until_sunrise();
