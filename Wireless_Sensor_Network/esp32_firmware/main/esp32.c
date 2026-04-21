@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -29,9 +30,15 @@
 #include <stdint.h>
 #include "esp_spiffs.h"
 #include <sys/stat.h>
+#include "cJSON.h"
+#include "panel_config.h"
+
+panel_config_t g_panel_config;
 
 static const char *TAG_HTTP = "HTTP_TIME";
 static bool sntp_initialized = false;
+static char macID[13];
+char panelName[50];
 
 void obtain_time(void);
 bool is_daytime(void);
@@ -50,8 +57,8 @@ extern const uint8_t InfluxRootCA_pem_end[]   asm("_binary_InfluxRootCA_pem_end"
 #define I2C_MASTER_FREQ_HZ          100000
 #define I2C_MASTER_TX_BUF_DISABLE   0
 #define I2C_MASTER_RX_BUF_DISABLE   0
-#define MCP3426_ADDR                0x6E  // I2C address of MCP3426
-
+//#define MCP3426_ADDR                0x6E  // I2C address of MCP3426 blue board
+#define MCP3426_ADDR                0x6B  // I2C address of MCP3426 green board
 
 // SPI (MAX31865)
 #define PIN_NUM_MISO 12
@@ -244,6 +251,7 @@ void get_mac_address(char *mac_str, size_t len) {
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+
 static const char *TAG = "MCP3426";
 
 void ota_update_task(void *pvParameter)
@@ -291,7 +299,7 @@ static esp_err_t i2c_master_init(void)
                               I2C_MASTER_TX_BUF_DISABLE, 0);
 }
 
-// Start a one-shot 12-bit conversion
+//Start a one-shot 12-bit conversion
 static esp_err_t mcp3426_start_conversion(uint8_t channel)
 {
     uint8_t config = 0b10000000; // start, CH1, one-shot, 12-bit, gain=1
@@ -312,7 +320,7 @@ static esp_err_t mcp3426_read_12bit(int16_t *result)
 
         uint8_t cfg = data[2];
         if ((cfg & 0x80) == 0) {  // RDY=0 → data ready
-            int16_t raw = ((data[0] << 8) | data[1]);
+            int16_t raw = (int16_t)((data[0] << 8) | data[1]);
             *result = raw;
             return ESP_OK;
         }
@@ -341,7 +349,7 @@ float getVoltage()
     int adcReading = getADC(1);
     float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
     voltage *= (118.0f + 4.02f) / 4.02f;                     // voltage divider
-    voltage *= 1.975; 
+    //voltage *= 1.95; 
     play_voltage_sensed();
     save_log_spiffs("Voltage measured");
     return voltage;
@@ -352,7 +360,8 @@ float getCurrent()
     int adcReading = getADC(2);
     float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
     float current = (voltage * 1.62f) - 0.33f; // apply sensor scaling factor
-    current = (current/0.264f)*1.975;
+    //current = (current/0.264f)*1.975;
+    current = (current/0.264f);
     return (current < 0.0f) ? 0.0f : current;
 }
 
@@ -433,10 +442,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         save_log_spiffs("WiFi connected");
 
         play_wifi_connected();
-        //vTaskDelay(pdMS_TO_TICKS(500));
 
         //Initialising SNTP
-    if (!sntp_initialized) {
+        if (!sntp_initialized) {
         obtain_time();
         sntp_initialized = true;
     }
@@ -490,8 +498,6 @@ void wifi_init_sta(void) {
 }
 
 
-
-
 void obtain_time(void) {
     ESP_LOGI(TAGMQTT, "Initializing SNTP...");
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
@@ -531,16 +537,16 @@ void obtain_time(void) {
 
 
 bool is_daytime(void) {
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
+    // time_t now;
+    // struct tm timeinfo;
+    // time(&now);
+    // localtime_r(&now, &timeinfo);
 
-    int hour = timeinfo.tm_hour;
-    return (hour >= SUNRISE_HOUR && hour < SUNSET_HOUR);
+    // int hour = timeinfo.tm_hour;
+    // return (hour >= SUNRISE_HOUR && hour < SUNSET_HOUR);
 
-    // ESP_LOGI(TAGMQTT, "Mock daytime for testing");
-    // return true;
+    //ESP_LOGI(TAGMQTT, "Mock daytime for testing");
+    return true;
 
 //     ESP_LOGI(TAGMQTT, "Mock night for testing");
 //     return false;
@@ -575,12 +581,18 @@ void send_to_influx(sensor_sample_t sample) {
     time_t ts = sample.timestamp;
 
     // Prepare InfluxDB line protocol
-    snprintf(line, sizeof(line),
-        "solar_data,device=esp32_01 voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
-        sample.voltage, sample.current, sample.power, sample.temperature, ts
-    );
+    // snprintf(line, sizeof(line),
+    //     "solar_data,device=esp32_02 voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
+    //     sample.voltage, sample.current, sample.power, sample.temperature, ts
+    // );
 
-    // Build full URL
+    snprintf(line, sizeof(line),
+        "solar,MCU=%s,panel_label=%s,panel_sn=%s voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
+        macID, g_panel_config.panel_label,g_panel_config.panel_sn, sample.voltage, sample.current, sample.power, sample.temperature, ts
+    );
+    printf("INFLUX LINE >>> %s\n", line);
+
+    // Build full URLe
     char url[256];
     snprintf(url, sizeof(url),
              "%s/api/v2/write?org=%s&bucket=%s&precision=s",
@@ -952,6 +964,41 @@ void wifi_mqtt_task(void *pvParameters) {
     }
 }
 
+void serial_task(void *arg)
+{
+    char input[128];
+
+    while (1)
+    {
+        if (fgets(input, sizeof(input), stdin) != NULL)
+        {
+            input[strcspn(input, "\r\n")] = 0;  // remove newline
+
+            char label[32], sn[32];
+
+            if (sscanf(input, "set_panel %31s %31s", label, sn) == 2)
+            {
+                strcpy(g_panel_config.panel_label, label);
+                strcpy(g_panel_config.panel_sn, sn);
+
+                panel_config_save(&g_panel_config);
+
+                ESP_LOGI("CONFIG", "Updated panel_label=%s panel_sn=%s",
+                         g_panel_config.panel_label,
+                         g_panel_config.panel_sn);
+            }
+            else if (strcmp(input, "show_panel") == 0)
+            {
+                ESP_LOGI("CONFIG", "panel_label=%s panel_sn=%s",
+                         g_panel_config.panel_label,
+                         g_panel_config.panel_sn);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 
 
 void app_main(void) {
@@ -964,6 +1011,18 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    //configuring panel associated to esp
+
+    if (panel_config_load(&g_panel_config) == ESP_ERR_NVS_NOT_FOUND) {
+        strcpy(g_panel_config.panel_label, "Not_Set");
+        strcpy(g_panel_config.panel_sn, "Not_Set");
+        panel_config_save(&g_panel_config);
+    }
+
+    ESP_LOGI("CONFIG", "Panel Label: %s | SN: %s",
+             g_panel_config.panel_label,
+             g_panel_config.panel_sn);
 
     //spiffs logs
     init_spiffs();
@@ -991,13 +1050,14 @@ void app_main(void) {
     sensor_queue = xQueueCreate(20, sizeof(sensor_sample_t));
 
     // Setup MQTT topic
-    char macID[13];
+    //char macID[13];
     get_mac_address(macID, sizeof(macID));
     snprintf(topic, sizeof(topic), "sensor/%s", macID);
 
     // Create FreeRTOS tasks pinned to cores
     xTaskCreatePinnedToCore(sensor_task, "sensor_task", 8192, NULL, 2, NULL, 0);     // Core 0
     xTaskCreatePinnedToCore(wifi_mqtt_task, "wifi_mqtt_task", 12288, NULL, 2, NULL, 1); // Core 1
+    xTaskCreatePinnedToCore(serial_task,"serial_task",4096,NULL,1,NULL,1);//task to enter panel details via serial input
 
     ESP_LOGI(TAGMQTT, "Sensor Task free stack: %u bytes",
              uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
