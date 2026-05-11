@@ -24,16 +24,33 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "driver/gpio.h"
-#include "esp_https_ota.h"
-#include "esp_http_client.h"
+#include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include <stdint.h>
 #include "esp_spiffs.h"
 #include <sys/stat.h>
 #include "cJSON.h"
 #include "panel_config.h"
+<<<<<<< HEAD
 
 panel_config_t g_panel_config;
+=======
+#include "mdns.h"
+#include "esp_netif.h"
+
+
+#ifndef MIN
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
+panel_config_t g_panel_config;
+
+static const char *OTA_TAG = "OTA";
+
+#define OTA_URL "/update"
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
 
 static const char *TAG_HTTP = "HTTP_TIME";
 static bool sntp_initialized = false;
@@ -59,6 +76,10 @@ extern const uint8_t InfluxRootCA_pem_end[]   asm("_binary_InfluxRootCA_pem_end"
 #define I2C_MASTER_RX_BUF_DISABLE   0
 //#define MCP3426_ADDR                0x6E  // I2C address of MCP3426 blue board
 #define MCP3426_ADDR                0x6B  // I2C address of MCP3426 green board
+<<<<<<< HEAD
+=======
+#define TEMP_SENSOR_ENABLE_GPIO 25
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
 
 // SPI (MAX31865)
 #define PIN_NUM_MISO 12
@@ -77,6 +98,10 @@ static const float A = 3.9083e-3;
 static const float B = -5.775e-7;
 
 #define BUZZER_PIN 2
+
+//ota status variables
+static const char *ota_status = "idle";
+static esp_reset_reason_t last_reset_reason;
 
 
 // GLOBALS 
@@ -105,9 +130,6 @@ typedef struct {
 } sensor_sample_t;
 
 static QueueHandle_t sensor_queue;
-
-#define OTA_URL "http://NEHA.local:8000/esp32.bin"
-static const char *TAG_OTA = "OTA";
 
 sensor_sample_t eeprom_buffer[MAX_SAMPLES];
 int eeprom_index = 0;  // next free slot
@@ -254,32 +276,117 @@ void get_mac_address(char *mac_str, size_t len) {
 
 static const char *TAG = "MCP3426";
 
-void ota_update_task(void *pvParameter)
+//  mDNS initialization
+void start_mdns_service(void)
 {
-    ESP_LOGI(TAG, "Starting OTA update...");
+    char mac_str[13];  // 12 chars + null
+    get_mac_address(mac_str, sizeof(mac_str));
 
-    // First create http client config
-    esp_http_client_config_t http_config = {
-        .url = OTA_URL,
-        .timeout_ms = 10000,
-    };
+    char hostname[40];
+    snprintf(hostname, sizeof(hostname), "esp32-%s", mac_str);
 
-    // Then create OTA config and assign pointer
-    esp_https_ota_config_t ota_config = {
-        .http_config = &http_config
-    };
+    ESP_ERROR_CHECK(mdns_init());
+    ESP_ERROR_CHECK(mdns_hostname_set(hostname));
+    ESP_ERROR_CHECK(mdns_instance_name_set("Solar ESP32 Node"));
 
-    // Start OTA
-    esp_err_t ret = esp_https_ota(&ota_config);
+    ESP_LOGI("mDNS", "Hostname: %s.local", hostname);
+}
 
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "OTA update successful, restarting...");
-        esp_restart();
-    } else {
-        ESP_LOGE(TAG, "OTA update failed! Error 0x%x", ret);
+//OTA update handler
+static esp_err_t upload_handler(httpd_req_t *req)
+{
+    char buf[1024];
+    int len;
+
+    const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
+    if (!ota_partition) {
+        ESP_LOGE("OTA", "No OTA partition found");
+        return ESP_FAIL;
     }
 
-    vTaskDelete(NULL);
+    esp_ota_handle_t ota_handle = 0;
+
+    esp_err_t err = esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("OTA", "esp_ota_begin failed: %s", esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    int remaining = req->content_len;
+
+    while (remaining > 0) {
+
+        len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
+
+        if (len <= 0) {
+            ota_status = "failed";
+            ESP_LOGE("OTA", "Receive failed");
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "OTA FAILED: receive error");
+            return ESP_FAIL;
+        }
+
+        err = esp_ota_write(ota_handle, buf, len);
+        if (err != ESP_OK) {
+            ota_status = "failed";
+            ESP_LOGE("OTA", "esp_ota_write failed: %s", esp_err_to_name(err));
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "OTA FAILED: write error");
+            return ESP_FAIL;
+        }
+
+        remaining -= len;
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ota_status = "failed";
+        ESP_LOGE("OTA", "esp_ota_end failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "OTA FAILED: finalize error");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(ota_partition);
+    if (err != ESP_OK) {
+        ota_status = "failed";
+        ESP_LOGE("OTA", "set boot partition failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "OTA FAILED: set boot partition failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "OTA SUCCESS", HTTPD_RESP_USE_STRLEN);
+
+    // give TCP stack time to flush fully
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    esp_restart();
+
+    return ESP_OK;
+}
+
+//registering endpoint
+static httpd_uri_t update_uri = {
+    .uri = "/update",
+    .method = HTTP_POST,
+    .handler = upload_handler,
+    .user_ctx = NULL
+};
+
+void start_ota_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+
+    httpd_start(&server, &config);
+    httpd_register_uri_handler(server, &update_uri);
+
+    ESP_LOGI("OTA", "OTA server started at /update");
 }
 
 // I²C initialization
@@ -365,9 +472,17 @@ float getCurrent()
     return (current < 0.0f) ? 0.0f : current;
 }
 
+void temp_sensor_power_on(void)
+{
+    gpio_reset_pin(TEMP_SENSOR_ENABLE_GPIO);
+    gpio_set_direction(TEMP_SENSOR_ENABLE_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(TEMP_SENSOR_ENABLE_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(300));
+}
 
 //  MAX31865 INIT
 void max31865_init(void) {
+    temp_sensor_power_on();
     esp_err_t ret;
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
@@ -451,9 +566,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     
     //creating a small task to do eeprom data transfer
     xTaskCreate(send_eeprom_task, "send_eeprom_task", 8192, NULL, 5, NULL);
-        
-    // Start OTA task
-    xTaskCreate(&ota_update_task, "ota_task", 8192, NULL, 5, NULL);
+    
+    // Start mDNS service after WiFi connected
+    start_mdns_service();
+
+    // Start OTA server after WiFi connected
+    start_ota_server();
     }
 }
 
@@ -580,6 +698,7 @@ void send_to_influx(sensor_sample_t sample) {
     char line[256];
     time_t ts = sample.timestamp;
 
+<<<<<<< HEAD
     // Prepare InfluxDB line protocol
     // snprintf(line, sizeof(line),
     //     "solar_data,device=esp32_02 voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
@@ -592,6 +711,14 @@ void send_to_influx(sensor_sample_t sample) {
     );
     printf("INFLUX LINE >>> %s\n", line);
 
+=======
+    snprintf(line, sizeof(line),
+        "solar,MCU=%s,location=%s,panel_sn=%s voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
+        macID, g_panel_config.location, g_panel_config.panel_sn, sample.voltage, sample.current, sample.power, sample.temperature, ts
+    );
+    printf("INFLUX LINE >>> %s\n", line);
+
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
     // Build full URLe
     char url[256];
     snprintf(url, sizeof(url),
@@ -974,23 +1101,41 @@ void serial_task(void *arg)
         {
             input[strcspn(input, "\r\n")] = 0;  // remove newline
 
+<<<<<<< HEAD
             char label[32], sn[32];
 
             if (sscanf(input, "set_panel %31s %31s", label, sn) == 2)
             {
                 strcpy(g_panel_config.panel_label, label);
+=======
+            char location[32], sn[32];
+
+            if (sscanf(input, "set_panel %31s %31s", location, sn) == 2)
+            {
+                strcpy(g_panel_config.location, location);
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
                 strcpy(g_panel_config.panel_sn, sn);
 
                 panel_config_save(&g_panel_config);
 
+<<<<<<< HEAD
                 ESP_LOGI("CONFIG", "Updated panel_label=%s panel_sn=%s",
                          g_panel_config.panel_label,
+=======
+                ESP_LOGI("CONFIG", "Updated location=%s panel_sn=%s",
+                         g_panel_config.location,
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
                          g_panel_config.panel_sn);
             }
             else if (strcmp(input, "show_panel") == 0)
             {
+<<<<<<< HEAD
                 ESP_LOGI("CONFIG", "panel_label=%s panel_sn=%s",
                          g_panel_config.panel_label,
+=======
+                ESP_LOGI("CONFIG", "location=%s panel_sn=%s",
+                         g_panel_config.location,
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
                          g_panel_config.panel_sn);
             }
         }
@@ -1003,6 +1148,8 @@ void serial_task(void *arg)
 
 void app_main(void) {
 
+    last_reset_reason = esp_reset_reason();
+
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
 
@@ -1013,15 +1160,25 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     //configuring panel associated to esp
+<<<<<<< HEAD
 
     if (panel_config_load(&g_panel_config) == ESP_ERR_NVS_NOT_FOUND) {
         strcpy(g_panel_config.panel_label, "Not_Set");
+=======
+    if (panel_config_load(&g_panel_config) == ESP_ERR_NVS_NOT_FOUND) {
+        strcpy(g_panel_config.location, "Not_Set");
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
         strcpy(g_panel_config.panel_sn, "Not_Set");
         panel_config_save(&g_panel_config);
     }
 
+<<<<<<< HEAD
     ESP_LOGI("CONFIG", "Panel Label: %s | SN: %s",
              g_panel_config.panel_label,
+=======
+    ESP_LOGI("CONFIG", "Location: %s | SN: %s",
+             g_panel_config.location,
+>>>>>>> 6dcde366ff44f5f8a4d4ab3c4d236fcf5cf94d89
              g_panel_config.panel_sn);
 
     //spiffs logs
