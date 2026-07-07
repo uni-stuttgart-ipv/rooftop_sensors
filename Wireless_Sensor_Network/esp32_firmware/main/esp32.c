@@ -35,17 +35,21 @@
 #include "panel_config.h"
 #include "mdns.h"
 #include "esp_netif.h"
+#include "esp_https_ota.h"
+#include "esp_adc/adc_oneshot.h"
 
+adc_oneshot_unit_handle_t adc_handle;
 
 #ifndef MIN
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
+volatile bool ota_in_progress = false;
+
 panel_config_t g_panel_config;
 
 static const char *OTA_TAG = "OTA";
-
-#define OTA_URL "/update"
+static TaskHandle_t ota_task_handle = NULL;
 
 static const char *TAG_HTTP = "HTTP_TIME";
 static bool sntp_initialized = false;
@@ -72,6 +76,10 @@ extern const uint8_t InfluxRootCA_pem_end[]   asm("_binary_InfluxRootCA_pem_end"
 //#define MCP3426_ADDR                0x6E  // I2C address of MCP3426 blue board
 #define MCP3426_ADDR                0x6B  // I2C address of MCP3426 green board
 #define TEMP_SENSOR_ENABLE_GPIO 25
+//define GY21_ADDR
+#define GY21_ADDR                   0x40
+#define GY21_CMD_TEMP_NO_HOLD       0xF3
+#define GY21_CMD_HUM_NO_HOLD        0xF5
 
 // SPI (MAX31865)
 #define PIN_NUM_MISO 12
@@ -84,12 +92,15 @@ extern const uint8_t InfluxRootCA_pem_end[]   asm("_binary_InfluxRootCA_pem_end"
 #define MAX31865_REG_CONFIG  0x00
 #define MAX31865_REG_RTD_MSB 0x01
 #define MAX31865_CONFIG_BIAS_ON   0x80
-#define MAX31865_CONFIG_AUTO_CONV 0x40
+#define MAX31865_CONFIG_AUTO_CONV 0x40 
 #define MAX31865_CONFIG_4WIRE     0x00
 static const float A = 3.9083e-3;
 static const float B = -5.775e-7;
 
+#define SENSOR_INVALID_VALUE   0
+
 #define BUZZER_PIN 2
+#define RESET_HOLD_GPIO 32
 
 //ota status variables
 static const char *ota_status = "idle";
@@ -112,12 +123,22 @@ static SemaphoreHandle_t i2c_semaphore = NULL;
 #define SAMPLE_SIZE sizeof(sensor_sample_t)
 #define MAX_SAMPLES (EEPROM_SIZE / SAMPLE_SIZE)
 
+#define CURRENT_FIRMWARE_VERSION "1.0.0"
+#define OTA_TOTAL_TIMEOUT_MS (5 * 60 * 1000) //OTA is given 5 minutes to complete or else revert back
+
+//checks OTA version before updating
+#define VERSION_URL "https://raw.githubusercontent.com/uni-stuttgart-ipv/rooftop_sensors/refs/heads/dev/version.json"
+//#define VERSION_URL "https://raw.githubusercontent.com/Neha-kb/rooftop_sensors/refs/heads/dev/version.json"
+
 
 typedef struct {
     float voltage;
     float current;
     float power;
     float temperature;
+    float ambient_temperature;  // GY-21 air temperature
+    float humidity;             // GY-21 humidity
+    float irradiance;   
     time_t timestamp;
 } sensor_sample_t;
 
@@ -144,6 +165,14 @@ bool is_log_too_large(size_t max_size)
 void clear_logs_spiffs()
 {
     remove("/spiffs/logs.txt");
+}
+
+void reset_hold_high(void)
+{
+    gpio_reset_pin(RESET_HOLD_GPIO);
+    gpio_set_direction(RESET_HOLD_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(RESET_HOLD_GPIO, 1);
+    ESP_LOGI(TAGMQTT, "GPIO32 reset hold set HIGH");
 }
 
 void init_spiffs() {
@@ -255,8 +284,6 @@ void play_data_sent()
     play_note(659, 80);
 }
 
-
-
 //  HELPER: MAC ADDRESS 
 void get_mac_address(char *mac_str, size_t len) {
     uint8_t mac[6];
@@ -268,118 +295,198 @@ void get_mac_address(char *mac_str, size_t len) {
 
 static const char *TAG = "MCP3426";
 
-//  mDNS initialization
-void start_mdns_service(void)
+esp_err_t perform_ota_update(const char *url)
 {
-    char mac_str[13];  // 12 chars + null
-    get_mac_address(mac_str, sizeof(mac_str));
+    ESP_LOGI(OTA_TAG, "Starting OTA: %s", url);
 
-    char hostname[40];
-    snprintf(hostname, sizeof(hostname), "esp32-%s", mac_str);
+    esp_http_client_config_t http_config = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 30000,
+        .buffer_size = 8192,
+        .buffer_size_tx = 1024,
+        .keep_alive_enable = false,
+        .disable_auto_redirect = false,
+    };
 
-    ESP_ERROR_CHECK(mdns_init());
-    ESP_ERROR_CHECK(mdns_hostname_set(hostname));
-    ESP_ERROR_CHECK(mdns_instance_name_set("Solar ESP32 Node"));
+    esp_https_ota_config_t ota_config = {
+        .http_config = &http_config,
+    };
 
-    ESP_LOGI("mDNS", "Hostname: %s.local", hostname);
+    esp_https_ota_handle_t ota_handle = NULL;
+    esp_err_t ret = esp_https_ota_begin(&ota_config, &ota_handle);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(OTA_TAG, "OTA begin failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    int64_t start_time_us = esp_timer_get_time();
+
+    while (1) {
+        ret = esp_https_ota_perform(ota_handle);
+
+        if (ret != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            break;
+        }
+
+        int64_t elapsed_ms = (esp_timer_get_time() - start_time_us) / 1000;
+
+        if (elapsed_ms > OTA_TOTAL_TIMEOUT_MS) {
+            ESP_LOGE(OTA_TAG, "OTA timeout after %lld ms, aborting", elapsed_ms);
+            esp_https_ota_abort(ota_handle);
+            return ESP_ERR_TIMEOUT;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(OTA_TAG, "OTA perform failed: %s", esp_err_to_name(ret));
+        esp_https_ota_abort(ota_handle);
+        return ret;
+    }
+
+    if (!esp_https_ota_is_complete_data_received(ota_handle)) {
+        ESP_LOGE(OTA_TAG, "OTA image not fully received");
+        esp_https_ota_abort(ota_handle);
+        return ESP_FAIL;
+    }
+
+    ret = esp_https_ota_finish(ota_handle);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(OTA_TAG, "OTA success, rebooting...");
+        esp_restart();
+    }
+
+    ESP_LOGE(OTA_TAG, "OTA finish failed: %s", esp_err_to_name(ret));
+    return ret;
 }
 
-//OTA update handler
-static esp_err_t upload_handler(httpd_req_t *req)
+static esp_err_t fetch_version_json(char *out_buf, size_t max_len)
 {
-    char buf[1024];
-    int len;
+    char version_url[300];
 
-    const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
-    if (!ota_partition) {
-        ESP_LOGE("OTA", "No OTA partition found");
+    snprintf(version_url, sizeof(version_url),
+             "%s?nocache=%lld",
+             VERSION_URL,
+             esp_timer_get_time());
+
+    ESP_LOGI("OTA", "Fetching version URL: %s", version_url);
+
+    esp_http_client_config_t config = {
+        .url = version_url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 5000,
+        .buffer_size = 4096,
+        .keep_alive_enable = false,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE("OTA", "HTTP init failed");
         return ESP_FAIL;
     }
 
-    esp_ota_handle_t ota_handle = 0;
+    esp_http_client_set_header(client, "Cache-Control", "no-cache");
+    esp_http_client_set_header(client, "Pragma", "no-cache");
 
-    esp_err_t err = esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+    esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE("OTA", "esp_ota_begin failed: %s", esp_err_to_name(err));
+        ESP_LOGE("OTA", "HTTP open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    ESP_LOGI("OTA", "Content length: %d", content_length);
+
+    int read_len = esp_http_client_read_response(client, out_buf, max_len - 1);
+
+    if (read_len <= 0) {
+        ESP_LOGE("OTA", "Read failed");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
         return ESP_FAIL;
     }
 
-    int remaining = req->content_len;
+    out_buf[read_len] = '\0';
 
-    while (remaining > 0) {
+    ESP_LOGI("OTA", "RAW JSON:\n%s", out_buf);
 
-        len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
-
-        if (len <= 0) {
-            ota_status = "failed";
-            ESP_LOGE("OTA", "Receive failed");
-            esp_ota_abort(ota_handle);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                        "OTA FAILED: receive error");
-            return ESP_FAIL;
-        }
-
-        err = esp_ota_write(ota_handle, buf, len);
-        if (err != ESP_OK) {
-            ota_status = "failed";
-            ESP_LOGE("OTA", "esp_ota_write failed: %s", esp_err_to_name(err));
-            esp_ota_abort(ota_handle);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                        "OTA FAILED: write error");
-            return ESP_FAIL;
-        }
-
-        remaining -= len;
-    }
-
-    err = esp_ota_end(ota_handle);
-    if (err != ESP_OK) {
-        ota_status = "failed";
-        ESP_LOGE("OTA", "esp_ota_end failed: %s", esp_err_to_name(err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                        "OTA FAILED: finalize error");
-        return ESP_FAIL;
-    }
-
-    err = esp_ota_set_boot_partition(ota_partition);
-    if (err != ESP_OK) {
-        ota_status = "failed";
-        ESP_LOGE("OTA", "set boot partition failed");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                        "OTA FAILED: set boot partition failed");
-        return ESP_FAIL;
-    }
-
-    httpd_resp_set_status(req, "200 OK");
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, "OTA SUCCESS", HTTPD_RESP_USE_STRLEN);
-
-    // give TCP stack time to flush fully
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    esp_restart();
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
 
     return ESP_OK;
 }
 
-//registering endpoint
-static httpd_uri_t update_uri = {
-    .uri = "/update",
-    .method = HTTP_POST,
-    .handler = upload_handler,
-    .user_ctx = NULL
-};
-
-void start_ota_server(void)
+void check_for_update(void)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
+    char json[512];
 
-    httpd_start(&server, &config);
-    httpd_register_uri_handler(server, &update_uri);
+    ESP_LOGI("OTA", "Fetching version JSON...");
 
-    ESP_LOGI("OTA", "OTA server started at /update");
+    if (fetch_version_json(json, sizeof(json)) != ESP_OK) {
+        ESP_LOGE("OTA", "Failed to fetch version JSON");
+        return;
+    }
+
+    ESP_LOGI("OTA", "RAW JSON:\n%s", json);
+
+    cJSON *root = cJSON_Parse(json);
+    if (!root) {
+        ESP_LOGE("OTA", "JSON parse failed");
+        return;
+    }
+
+    cJSON *version_item = cJSON_GetObjectItem(root, "version");
+    cJSON *url_item = cJSON_GetObjectItem(root, "firmware_url");
+
+    if (!cJSON_IsString(version_item) || !cJSON_IsString(url_item)) {
+        ESP_LOGE("OTA", "Invalid JSON");
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *latest_version = version_item->valuestring;
+    const char *firmware_url = url_item->valuestring;
+
+    ESP_LOGI("OTA", "Latest version: %s", latest_version);
+
+    if (strcmp(latest_version, CURRENT_FIRMWARE_VERSION) != 0) {
+    ESP_LOGI("OTA", "New firmware found!");
+
+    ota_in_progress = true;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    esp_err_t ota_ret = perform_ota_update(firmware_url);
+
+    ota_in_progress = false;
+
+    if (ota_ret != ESP_OK) {
+        ESP_LOGE("OTA", "OTA failed or timed out, resuming normal firmware");
+        cJSON_Delete(root);
+        return;
+    }
+    } else {
+    ESP_LOGI("OTA", "Already up to date");
+    }
+
+    cJSON_Delete(root);
 }
+
+void ota_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(5000)); // wait for WiFi stable
+    while (1) {
+        ESP_LOGI("OTA", "Periodic OTA check...");
+        check_for_update();
+
+        vTaskDelay(pdMS_TO_TICKS(2 * 60 * 1000)); // every 2 minutes checking new firmware
+    }
+}
+
 
 // I²C initialization
 static esp_err_t i2c_master_init(void)
@@ -396,6 +503,28 @@ static esp_err_t i2c_master_init(void)
     return i2c_driver_install(I2C_MASTER_NUM, conf.mode,
                               I2C_MASTER_RX_BUF_DISABLE,
                               I2C_MASTER_TX_BUF_DISABLE, 0);
+}
+
+void irradiance_adc_init()
+{
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
+
+    ESP_LOGI("ADC", "Handle after init = %p", adc_handle);
+
+    adc_oneshot_chan_cfg_t config = {
+        .atten = ADC_ATTEN_DB_11,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(
+        adc_handle,
+        ADC_CHANNEL_6,   // GPIO34
+        &config
+    ));
 }
 
 //Start a one-shot 12-bit conversion
@@ -464,6 +593,21 @@ float getCurrent()
     return (current < 0.0f) ? 0.0f : current;
 }
 
+float getIrradiance()
+{
+    int raw;
+
+    adc_oneshot_read(
+        adc_handle,
+        ADC_CHANNEL_6,
+        &raw
+    );
+
+    float voltage = (raw / 4095.0f) * 3.3f;
+
+    return voltage * 1000.0f;
+}
+
 void temp_sensor_power_on(void)
 {
     gpio_reset_pin(TEMP_SENSOR_ENABLE_GPIO);
@@ -528,6 +672,74 @@ float getTemperature() {
     return temp;
 }
 
+static esp_err_t gy21_read_raw(uint8_t command, uint16_t *raw_value, uint32_t delay_ms)
+{
+    esp_err_t err = i2c_master_write_to_device(
+        I2C_MASTER_NUM,
+        GY21_ADDR,
+        &command,
+        1,
+        pdMS_TO_TICKS(100)
+    );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+
+    uint8_t data[3] = {0};
+
+    err = i2c_master_read_from_device(
+        I2C_MASTER_NUM,
+        GY21_ADDR,
+        data,
+        3,
+        pdMS_TO_TICKS(100)
+    );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
+    raw &= 0xFFFC;
+
+    *raw_value = raw;
+    return ESP_OK;
+}
+
+float getAmbientTemperatureGY21(void)
+{
+    uint16_t raw = 0;
+
+    esp_err_t err = gy21_read_raw(GY21_CMD_TEMP_NO_HOLD, &raw, 100);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAGMQTT, "Failed to read GY-21 temperature: %s", esp_err_to_name(err));
+        return SENSOR_INVALID_VALUE;
+    }
+
+    return -46.85f + (175.72f * (float)raw / 65536.0f);
+}
+
+float getHumidityGY21(void)
+{
+    uint16_t raw = 0;
+
+    esp_err_t err = gy21_read_raw(GY21_CMD_HUM_NO_HOLD, &raw, 100);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAGMQTT, "Failed to read GY-21 humidity: %s", esp_err_to_name(err));
+        return SENSOR_INVALID_VALUE;
+    }
+
+    float humidity = -6.0f + (125.0f * (float)raw / 65536.0f);
+
+    if (humidity < 0.0f) humidity = 0.0f;
+    if (humidity > 100.0f) humidity = 100.0f;
+
+    return humidity;
+}
+
 //bool mqtt_ready = false;
 
 // Wi-Fi event handler for reconnection
@@ -550,6 +762,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
         play_wifi_connected();
 
+        //We disable power save mode to ensure stable connection
+        esp_wifi_set_ps(WIFI_PS_NONE);
+
         //Initialising SNTP
         if (!sntp_initialized) {
         obtain_time();
@@ -559,14 +774,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     //creating a small task to do eeprom data transfer
     xTaskCreate(send_eeprom_task, "send_eeprom_task", 8192, NULL, 5, NULL);
     
-    // Start mDNS service after WiFi connected
-    start_mdns_service();
-
-    // Start OTA server after WiFi connected
-    start_ota_server();
+    if (ota_task_handle == NULL) {
+        xTaskCreate(ota_task, "ota_task", 12288, NULL, 5, &ota_task_handle);
+    }
     }
 }
-
 
 //  WIFI INIT 
 void wifi_init_sta(void) {
@@ -687,22 +899,62 @@ bool wifi_connected() {
 
 
 void send_to_influx(sensor_sample_t sample) {
-    char line[256];
+    if (ota_in_progress) {
+        ESP_LOGI(TAGMQTT, "OTA in progress, skipping InfluxDB upload");
+        return;
+    }
+
+    char line1[256] = {0};
+    char line2[256] = {0};
+    char payload[512] = {0};
     time_t ts = sample.timestamp;
 
-    snprintf(line, sizeof(line),
-        "solar,MCU=%s,location=%s,panel_sn=%s voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
-        macID, g_panel_config.location, g_panel_config.panel_sn, sample.voltage, sample.current, sample.power, sample.temperature, ts
-    );
-    printf("INFLUX LINE >>> %s\n", line);
+    switch (g_panel_config.board_type)
+    {
+        case BOARD_NORMAL:
+        snprintf(line1, sizeof(line1),
+            "panel_parameters,mcu=%s,string=%s,panel_sn=%s,location=%s voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
+            macID, g_panel_config.String, g_panel_config.panel_sn, g_panel_config.location, sample.voltage, sample.current, sample.power, sample.temperature,ts
+        );
+        break;
+    case BOARD_GY21:
+        snprintf(line1, sizeof(line1),
+            "panel_parameters,mcu=%s,string=%s,panel_sn=%s,location=%s voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
+            macID, g_panel_config.String, g_panel_config.panel_sn, g_panel_config.location, sample.voltage, sample.current, sample.power, sample.temperature,ts
+        );
+        snprintf(line2, sizeof(line2),
+            "temperature_humidity,mcu=%s ambient_temperature=%.2f,humidity=%.2f %lld",
+            macID,sample.ambient_temperature,sample.humidity,ts
+        );
+        break;
+    case BOARD_IRRADIANCE:
+        snprintf(line1, sizeof(line1),
+            "panel_parameters,mcu=%s,string=%s,panel_sn=%s,location=%s voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld",
+            macID, g_panel_config.String, g_panel_config.panel_sn, g_panel_config.location, sample.voltage, sample.current, sample.power, sample.temperature,ts
+        );
+        snprintf(line2, sizeof(line2),
+            "irradiance,mcu=%s irradance=%.2f %lld",
+            macID,sample.irradiance,ts
+        );
+        break;
+    default:
+        ESP_LOGE(TAGMQTT, "Unknown board type: %d", g_panel_config.board_type);
+        return;
+    }
+    
+    if (line2[0] != '\0') {
+        snprintf(payload, sizeof(payload), "%s\n%s", line1, line2);
+    } else {
+        snprintf(payload, sizeof(payload), "%s", line1);
+    }
 
-    // Build full URLe
+    printf("INFLUX PAYLOAD:\n%s\n", payload);
+
     char url[256];
     snprintf(url, sizeof(url),
              "%s/api/v2/write?org=%s&bucket=%s&precision=s",
              INFLUX_URL, INFLUX_ORG, INFLUX_BUCKET);
 
-    // HTTP client config
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
@@ -712,24 +964,23 @@ void send_to_influx(sensor_sample_t sample) {
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
 
-    // **Important:** Authorization header must start with "Token "
-    char auth_header[512];
+    char auth_header[256];
     snprintf(auth_header, sizeof(auth_header), "Token %s", INFLUX_TOKEN);
+
     esp_http_client_set_header(client, "Authorization", auth_header);
     esp_http_client_set_header(client, "Content-Type", "text/plain; charset=utf-8");
 
-    // Set data to POST
-    esp_http_client_set_post_field(client, line, strlen(line));
+    esp_http_client_set_post_field(client, payload, strlen(payload));
 
-    // Perform request
     esp_err_t err = esp_http_client_perform(client);
+
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
+
         if (status == 204) {
             ESP_LOGI(TAGMQTT, "InfluxDB write OK");
             save_log_spiffs("Data sent to InfluxDB");
             play_data_sent();
-            //vTaskDelete(NULL);
         } else {
             ESP_LOGE(TAGMQTT, "InfluxDB HTTP error: %d", status);
         }
@@ -737,7 +988,6 @@ void send_to_influx(sensor_sample_t sample) {
         ESP_LOGE(TAGMQTT, "InfluxDB POST failed: %s", esp_err_to_name(err));
     }
 
-    // Cleanup
     esp_http_client_cleanup(client);
 }
 
@@ -752,66 +1002,6 @@ bool is_eeprom_too_large(size_t max_size)
     return false;
 }
 
-//sending data to influxdb as batch
-// esp_err_t send_to_influx_batch(const char *payload)
-// {
-//     esp_http_client_config_t config = {
-//         .url = "http://YOUR_INFLUX_URL",
-//         .method = HTTP_METHOD_POST,
-//         .timeout_ms = 5000,
-//     };
-
-//     esp_http_client_handle_t client = esp_http_client_init(&config);
-
-//     esp_http_client_set_header(client, "Content-Type", "text/plain");
-
-//     esp_http_client_set_post_field(client, payload, strlen(payload));
-
-//     esp_err_t err = esp_http_client_perform(client);
-
-//     esp_http_client_cleanup(client);
-
-//     return err;
-// }
-
-// //  SAVE SAMPLE TO EEPROM (simulated with RAM buffer) 
-// void save_to_eeprom(sensor_sample_t *sample, int index) {
-//     if (index < MAX_SAMPLES) {
-//         eeprom_buffer[index] = *sample;
-//         ESP_LOGI(TAGMQTT, "Saved sample to EEPROM at index %d", index);
-//     }
-//     // eeprom_index=index;
-//     ESP_LOGI(TAGMQTT, "Total sample index noted to be %d",eeprom_index);
-// }
-
-
-// //  READ SAMPLE FROM EEPROM (RAM buffer for simulation) 
-// void read_from_eeprom(int index, sensor_sample_t *sample) {
-//     if (index < MAX_SAMPLES && sample != NULL) {
-//         *sample = eeprom_buffer[index];
-//     } else {
-//         ESP_LOGW(TAGMQTT, "EEPROM read failed at index %d", index);
-//     }
-// }
-
-// // SEND ALL EEPROM SAMPLES AFTER SUNSET 
-// void send_eeprom_data() {
-//     ESP_LOGI(TAGMQTT, "Calling send_eeprom function");
-//     ESP_LOGI(TAGMQTT, "Total sample index noted to be %d",eeprom_index);
-//     if (eeprom_index == 0) 
-//     {
-//         ESP_LOGI(TAGMQTT, "Nothing to sent from EEPROM");
-//         return; // nothing to send
-//     }
-//     ESP_LOGI(TAGMQTT, "Sending %d stored samples from EEPROM...", eeprom_index);
-//     for (int i = 0; i < eeprom_index; i++) {
-//         send_to_influx(eeprom_buffer[i]);
-//         vTaskDelay(pdMS_TO_TICKS(500)); // small delay between messages
-//     }
-//     ESP_LOGI(TAGMQTT, "All stored EEPROM data sent. Clearing buffer.");
-//     save_log_spiffs("All data from eeprom sent");
-//     eeprom_index = 0; // clear buffer
-// }
 
 void save_eeprom_data(sensor_sample_t *sample)
 {
@@ -906,60 +1096,6 @@ void send_eeprom_data()
     remove("/spiffs/eeprom_data.bin");
 }
 
-//function to send all eeprom data in one batch instead of multiple https requets
-// void send_eeprom_data()
-// {
-//     ESP_LOGI(TAGMQTT, "Calling send_eeprom function");
-//     ESP_LOGI(TAGMQTT, "Total sample index noted to be %d", eeprom_index);
-
-//     if (eeprom_index == 0) {
-//         ESP_LOGI(TAGMQTT, "Nothing to send from EEPROM");
-//         return;
-//     }
-
-//     char payload[2048];  // adjust size if needed
-//     memset(payload, 0, sizeof(payload));
-
-//     ESP_LOGI(TAGMQTT, "Preparing batch payload...");
-
-//     for (int i = 0; i < eeprom_index; i++) {
-
-//         char line[256];
-
-//         snprintf(line, sizeof(line),
-//             "solar_data,device=esp32_01 voltage=%.2f,current=%.2f,power=%.2f,temperature=%.2f %lld\n",
-//             eeprom_buffer[i].voltage,
-//             eeprom_buffer[i].current,
-//             eeprom_buffer[i].power,
-//             eeprom_buffer[i].temperature,
-//             (long long)eeprom_buffer[i].timestamp
-//         );
-
-//         // Prevent buffer overflow
-//         if (strlen(payload) + strlen(line) < sizeof(payload)) {
-//             strcat(payload, line);
-//         } else {
-//             ESP_LOGE(TAGMQTT, "Payload too large! Sending partial batch...");
-//             break;
-//         }
-//     }
-
-//     ESP_LOGI(TAGMQTT, "Sending batch to Influx...");
-
-//     // Send once
-//     int status = send_to_influx_batch(payload);
-
-//     if (status == ESP_OK) {
-//         ESP_LOGI(TAGMQTT, "Batch sent successfully. Clearing EEPROM.");
-
-//         save_log_spiffs("All EEPROM data sent");
-
-//         eeprom_index = 0;
-//     } else {
-//         ESP_LOGE(TAGMQTT, "Failed to send batch. Keeping data in EEPROM.");
-//     }
-// }
-
 void sensor_task(void *pvParameters) {
     sensor_sample_t sample;
 
@@ -967,7 +1103,15 @@ void sensor_task(void *pvParameters) {
         sample.voltage = getVoltage();
         sample.current = getCurrent();
         sample.power = sample.voltage * sample.current;
-        sample.temperature = getTemperature();
+        sample.temperature = getTemperature();//max31865
+        if (g_panel_config.board_type == BOARD_GY21) {
+        sample.ambient_temperature = getAmbientTemperatureGY21(); 
+        sample.humidity = getHumidityGY21();          
+        }// GY-21
+        if (g_panel_config.board_type == BOARD_IRRADIANCE)
+        {
+            sample.irradiance = getIrradiance();
+        }
         sample.timestamp = time(NULL);
 
         xQueueSend(sensor_queue, &sample, pdMS_TO_TICKS(10)); // push to queue
@@ -975,38 +1119,6 @@ void sensor_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(2000)); // delay in millisecond
     }
 }
-
-//obtaining sensor values by averaging
-// void sensor_task(void *pvParameters)
-// {
-//     while (1)
-//     {
-//         float voltage_sum = 0;
-//         float current_sum = 0;
-//         float temp_sum = 0;
-
-//         int samples = 4;
-
-//         for (int i = 0; i < samples; i++) {
-//             voltage_sum += getVoltage();
-//             current_sum += getCurrent();
-//             temp_sum += getTemperature();
-
-//             vTaskDelay(pdMS_TO_TICKS(1000)); // 1 reading/sec
-//         }
-
-//         sensor_sample_t sample;
-
-//         sample.voltage = voltage_sum / samples;
-//         sample.current = current_sum / samples;
-//         sample.temperature = temp_sum / samples;
-//         sample.power = sample.voltage * sample.current;
-//         sample.timestamp = time(NULL);
-
-//         xQueueSend(sensor_queue, &sample, pdMS_TO_TICKS(10));
-//     }
-// }
-
 
 
 void wifi_mqtt_task(void *pvParameters) {
@@ -1027,31 +1139,6 @@ void wifi_mqtt_task(void *pvParameters) {
                 ESP_LOGI(TAGMQTT, "Wi-Fi OK + Daytime: Sending data directly to InfluxDB...");
                 send_to_influx(sample);
             }
-
-            
-
-            // // else if (!wifi_ok && day) {
-            // else if (!wifi_ok) {
-            //     ESP_LOGW(TAGMQTT, "Wi-Fi down (Daytime): Storing sample to EEPROM...");
-
-            //     if (eeprom_index < MAX_SAMPLES) {
-            //         //save_to_eeprom(&sample, eeprom_index++);
-            //         save_eeprom_data(&sample);
-            //     } else {
-            //         ESP_LOGW(TAGMQTT, "EEPROM full, ignoring sample");
-            //     }
-
-            //     // Immediately read back to verify
-            //     sensor_sample_t readback;
-            //     for (int i = 0; i < eeprom_index; i++) {
-            //         read_from_eeprom(i, &readback);
-            //         ESP_LOGI(TAGMQTT,
-            //                  "EEPROM[%d]: V=%.2f, I=%.2f, P=%.2f, T=%.2f, TS=%lld",
-            //                  i, readback.voltage, readback.current,
-            //                  readback.power, readback.temperature,
-            //                  (long long)readback.timestamp);
-            //     }
-            // } 
 
             else if (!wifi_ok) {
                 ESP_LOGW(TAGMQTT, "Wi-Fi down: Storing sample to EEPROM");
@@ -1078,24 +1165,30 @@ void serial_task(void *arg)
         {
             input[strcspn(input, "\r\n")] = 0;  // remove newline
 
-            char location[32], sn[32];
+            char String[32], sn[32], location[32];
+            int board;
 
-            if (sscanf(input, "set_panel %31s %31s", location, sn) == 2)
+            if (sscanf(input, "set_panel %31s %31s %31s %d", String, sn,location, &board) == 4)
             {
-                strcpy(g_panel_config.location, location);
+                strcpy(g_panel_config.String, String);
                 strcpy(g_panel_config.panel_sn, sn);
-
+                strcpy(g_panel_config.location, location);
+                g_panel_config.board_type = board;
                 panel_config_save(&g_panel_config);
 
-                ESP_LOGI("CONFIG", "Updated location=%s panel_sn=%s",
+                ESP_LOGI("CONFIG", "Updated String=%s panel_sn=%s location=%s board_type=%d",
+                         g_panel_config.String,
+                         g_panel_config.panel_sn,
                          g_panel_config.location,
-                         g_panel_config.panel_sn);
+                         g_panel_config.board_type);
             }
             else if (strcmp(input, "show_panel") == 0)
             {
-                ESP_LOGI("CONFIG", "location=%s panel_sn=%s",
+                ESP_LOGI("CONFIG", "String=%s panel_sn=%s location=%s board_type=%d",
+                         g_panel_config.String,
+                         g_panel_config.panel_sn,
                          g_panel_config.location,
-                         g_panel_config.panel_sn);
+                         g_panel_config.board_type);
             }
         }
 
@@ -1107,7 +1200,11 @@ void serial_task(void *arg)
 
 void app_main(void) {
 
+    // PCB reset-control line: keep high to prevent periodic reset.
+    //reset_hold_high();
+
     last_reset_reason = esp_reset_reason();
+    ESP_LOGI(TAGMQTT, "Reset reason: %d", last_reset_reason);
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -1120,14 +1217,18 @@ void app_main(void) {
 
     //configuring panel associated to esp
     if (panel_config_load(&g_panel_config) == ESP_ERR_NVS_NOT_FOUND) {
+        strcpy(g_panel_config.String, "Not_Set");
         strcpy(g_panel_config.location, "Not_Set");
         strcpy(g_panel_config.panel_sn, "Not_Set");
+        g_panel_config.board_type = BOARD_UNSET;
         panel_config_save(&g_panel_config);
     }
 
-    ESP_LOGI("CONFIG", "Location: %s | SN: %s",
+    ESP_LOGI("CONFIG", "String: %s  | SN: %s | Location: %s | Board Type: %d",
+             g_panel_config.String,
+             g_panel_config.panel_sn,
              g_panel_config.location,
-             g_panel_config.panel_sn);
+             g_panel_config.board_type);
 
     //spiffs logs
     init_spiffs();
@@ -1150,6 +1251,7 @@ void app_main(void) {
     // Initialize hardware
     i2c_master_init();      // initialize I2C bus
     max31865_init();        // initialize MAX31865
+    irradiance_adc_init();  // initialize irradiance ADC
 
     // Create queue for sensor samples
     sensor_queue = xQueueCreate(20, sizeof(sensor_sample_t));
