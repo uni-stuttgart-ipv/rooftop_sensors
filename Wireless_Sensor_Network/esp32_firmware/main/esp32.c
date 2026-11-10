@@ -575,9 +575,10 @@ int getADC(uint8_t channel)
 float getVoltage()
 {
     int adcReading = getADC(1);
-    float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
-    voltage *= (118.0f + 4.02f) / 4.02f;                     // voltage divider
-    //voltage *= 1.95; 
+    //float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
+    //voltage *= (118.0f + 4.02f) / 4.02f;                     // voltage divider
+    //voltage *= 1.95; //for blue board extra mult factor required
+    float voltage= (float)adcReading /1000 *58.311694230;
     play_voltage_sensed();
     save_log_spiffs("Voltage measured");
     return voltage;
@@ -586,10 +587,11 @@ float getVoltage()
 float getCurrent()
 {
     int adcReading = getADC(2);
-    float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
-    float current = (voltage * 1.62f) - 0.33f; // apply sensor scaling factor
-    //current = (current/0.264f)*1.975;
-    current = (current/0.264f);
+    //float voltage = ((float)adcReading / 2047.0f) * 2.048f; 
+    //float current = (voltage * 1.62f) - 0.33f; // apply sensor scaling factor
+    //current = (current/0.264f)*1.975;//blue board
+    //current = (current/0.264f); //green board
+    float current = (((float)adcReading *1.62 /1000 ) -0.329) /0.264;
     return (current < 0.0f) ? 0.0f : current;
 }
 
@@ -603,9 +605,12 @@ float getIrradiance()
         &raw
     );
 
-    float voltage = (raw / 4095.0f) * 3.3f;
+    float voltage = ((float)raw / 4095.0f) * 3.3f + 0.13f;
+    float irradiance = voltage * 1000.0f;
 
-    return voltage * 1000.0f;
+    ESP_LOGI("IRR", "Raw = %d, Irradiance = %3f W/m²", raw, irradiance);
+
+    return irradiance;
 }
 
 void temp_sensor_power_on(void)
@@ -933,7 +938,7 @@ void send_to_influx(sensor_sample_t sample) {
             macID, g_panel_config.String, g_panel_config.panel_sn, g_panel_config.location, sample.voltage, sample.current, sample.power, sample.temperature,ts
         );
         snprintf(line2, sizeof(line2),
-            "irradiance,mcu=%s irradance=%.2f %lld",
+            "irradiance,mcu=%s irradiance=%.2f %lld",
             macID,sample.irradiance,ts
         );
         break;
@@ -1221,7 +1226,7 @@ void app_main(void) {
         strcpy(g_panel_config.location, "Not_Set");
         strcpy(g_panel_config.panel_sn, "Not_Set");
         g_panel_config.board_type = BOARD_UNSET;
-        panel_config_save(&g_panel_config);
+        panel_config _save(&g_panel_config);
     }
 
     ESP_LOGI("CONFIG", "String: %s  | SN: %s | Location: %s | Board Type: %d",

@@ -43,11 +43,11 @@ CLOUD_BUCKET = os.getenv("CLOUD_BUCKET")
 
 
 # --- Time range to migrate ---
-start_time = datetime.datetime(2025, 9, 1, 8, 0, 0, tzinfo=pytz.UTC)
-end_time   = datetime.datetime(2025 ,9, 1, 9, 0, 0, tzinfo=pytz.UTC)
+start_time = datetime.datetime(2026, 7, 1, 0, 0, 0, tzinfo=pytz.UTC)
+end_time   = datetime.datetime(2026, 9, 16, 0, 0, 0, tzinfo=pytz.UTC)
 
 # --- Fields you want to migrate ---
-ALLOWED_FIELDS = {"Temp",  "U", "I", "P"}
+ALLOWED_FIELDS = {"Temp",  "U", "I", "P","AmbHmd","AmbTemp","Irr"}
 
 # --- Batch write control ---
 BATCH_SIZE = 5000  # number of points per write
@@ -56,7 +56,7 @@ SLEEP_BETWEEN_BATCHES = 10  # seconds
 
 # Define callbacks for write responses
 def success(self, data: str):
-    print(f"Successfully wrote batch: data")
+    print(f"Successfully wrote batch: {data}")
 
 def error(self, data: str, exception: InfluxDBError):
     print(f"Failed writing batch: config: {self}, data: {data} due: {exception}")
@@ -66,7 +66,7 @@ def retry(self, data: str, exception: InfluxDBError):
 
 
 # --- Connect to OSS ---
-client_oss = InfluxDBClient(url=OSS_URL, token=OSS_TOKEN, org=OSS_ORG)
+client_oss = InfluxDBClient(url=OSS_URL, token=OSS_TOKEN, org=OSS_ORG, verify_ssl=False)
 query_api = client_oss.query_api()
 
 print("Querying OSS data...")
@@ -93,7 +93,7 @@ for table in tables:
         if field_name not in ALLOWED_FIELDS:
             continue
 
-        measurement = "ParkData_Migrated"
+        measurement = "MigratedData_2024-26"
 
 
         # Extract tags
